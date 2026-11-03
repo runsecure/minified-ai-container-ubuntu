@@ -1,0 +1,54 @@
+# Example workload on the core-selinux image.
+# "pod-security.kubernetes.io/enforce: restricted" makes the built-in Pod Security
+# Admission enforce non-root, no privilege escalation, drop ALL capabilities, seccomp,
+# and no privileged/spc_t containers. The selinux-required label turns on
+# selinux-admission-policy.yaml.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: minified-apps
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    minified.dev/selinux-required: "true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: example
+  namespace: minified-apps
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: example }
+  template:
+    metadata:
+      labels: { app: example }
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        minified.dev/selinux: enforcing
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+        seLinuxOptions:
+          type: container_t      # level omitted: the runtime assigns unique MCS categories per pod
+      containers:
+        - name: app
+          # An image built FROM minified/ubuntu-core:24.04-selinux that sets CMD (not ENTRYPOINT),
+          # so container-guard runs first and refuses to start if the pod isn't confined.
+          image: registry.example.com/my-app:1.0.0
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 64Mi }

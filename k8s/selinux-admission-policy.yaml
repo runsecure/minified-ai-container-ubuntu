@@ -1,0 +1,74 @@
+# Rejects pods in opted-in namespaces unless every container runs with an
+# allowed SELinux type and the pod is pinned to SELinux-enforcing nodes.
+#
+# Opt a namespace in with label:  minified.dev/selinux-required: "true"
+# Label SELinux-enforcing node pools (e.g. EKS Bottlerocket) with:
+#                                  minified.dev/selinux: enforcing
+#
+# Requires Kubernetes >= 1.30 (ValidatingAdmissionPolicy GA).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: minified-require-selinux
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods", "pods/ephemeralcontainers"]
+  variables:
+    - name: allowedTypes
+      expression: "['container_t', 'container_init_t', 'container_kvm_t']"
+    - name: podType
+      expression: >-
+        has(object.spec.securityContext) &&
+        has(object.spec.securityContext.seLinuxOptions) &&
+        has(object.spec.securityContext.seLinuxOptions.type)
+          ? object.spec.securityContext.seLinuxOptions.type : ''
+    - name: allContainers
+      expression: >-
+        object.spec.containers +
+        (has(object.spec.initContainers) ? object.spec.initContainers : []) +
+        (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])
+    # Kubelet replaces the whole seLinuxOptions struct when a container sets it,
+    # so a container-level seLinuxOptions without a type means "no type".
+    - name: badContainers
+      expression: >-
+        variables.allContainers.filter(c,
+          !(
+            (has(c.securityContext) && has(c.securityContext.seLinuxOptions)
+              ? (has(c.securityContext.seLinuxOptions.type) ? c.securityContext.seLinuxOptions.type : '')
+              : variables.podType) in variables.allowedTypes
+            ||
+            (has(c.securityContext) && has(c.securityContext.seLinuxOptions)
+              ? (has(c.securityContext.seLinuxOptions.type) ? c.securityContext.seLinuxOptions.type : '')
+              : variables.podType).endsWith('.process')
+          )
+        ).map(c, c.name)
+  validations:
+    - expression: "size(variables.badContainers) == 0"
+      messageExpression: >-
+        'SELinux type must be one of ' + variables.allowedTypes.join(', ') +
+        ' (or a udica *.process type), set explicitly in securityContext.seLinuxOptions.type; offending containers: ' +
+        variables.badContainers.join(', ')
+      reason: Forbidden
+    - expression: >-
+        has(object.spec.nodeSelector) &&
+        'minified.dev/selinux' in object.spec.nodeSelector &&
+        object.spec.nodeSelector['minified.dev/selinux'] == 'enforcing'
+      message: "pod must set nodeSelector minified.dev/selinux: enforcing so it only schedules on SELinux-enforcing nodes"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: minified-require-selinux
+spec:
+  policyName: minified-require-selinux
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        minified.dev/selinux-required: "true"

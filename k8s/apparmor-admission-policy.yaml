@@ -1,0 +1,86 @@
+# Rejects pods in opted-in namespaces unless every container runs under an
+# allowed AppArmor profile and the pod is pinned to AppArmor-enforcing nodes.
+#
+# Opt a namespace in with label:  minified.dev/apparmor-required: "true"
+# Label AppArmor node pools (e.g. Ubuntu nodes on EKS/AKS/GKE) with:
+#                                  minified.dev/apparmor: enforcing
+#
+# Allowed profiles: RuntimeDefault, or Localhost profiles whose name starts with one
+# of allowedLocalhostPrefixes (so only profiles you've vetted and deployed to nodes
+# are accepted; container-guard can't see what a profile allows).
+#
+# Requires Kubernetes >= 1.30 (ValidatingAdmissionPolicy and appArmorProfile GA).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: minified-require-apparmor
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods", "pods/ephemeralcontainers"]
+  variables:
+    - name: allowedLocalhostPrefixes
+      expression: "['minified-']"
+    - name: podHasProfile
+      expression: >-
+        has(object.spec.securityContext) && has(object.spec.securityContext.appArmorProfile)
+    - name: podType
+      expression: >-
+        variables.podHasProfile ? object.spec.securityContext.appArmorProfile.type : ''
+    - name: podLocal
+      expression: >-
+        variables.podHasProfile && has(object.spec.securityContext.appArmorProfile.localhostProfile)
+          ? object.spec.securityContext.appArmorProfile.localhostProfile : ''
+    - name: allContainers
+      expression: >-
+        object.spec.containers +
+        (has(object.spec.initContainers) ? object.spec.initContainers : []) +
+        (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])
+    # Effective profile per container. A container-level appArmorProfile replaces the pod-level one.
+    - name: effective
+      expression: >-
+        variables.allContainers.map(c,
+          has(c.securityContext) && has(c.securityContext.appArmorProfile)
+            ? {
+                'name': c.name,
+                'type': c.securityContext.appArmorProfile.type,
+                'local': has(c.securityContext.appArmorProfile.localhostProfile)
+                           ? c.securityContext.appArmorProfile.localhostProfile : ''
+              }
+            : {'name': c.name, 'type': variables.podType, 'local': variables.podLocal})
+    - name: badContainers
+      expression: >-
+        variables.effective.filter(e,
+          !(e.type == 'RuntimeDefault' ||
+            (e.type == 'Localhost' &&
+             variables.allowedLocalhostPrefixes.exists(p, e.local.startsWith(p))))
+        ).map(e, e.name)
+  validations:
+    - expression: "size(variables.badContainers) == 0"
+      messageExpression: >-
+        'AppArmor profile must be set explicitly (securityContext.appArmorProfile) to RuntimeDefault, ' +
+        'or Localhost with a profile name starting with ' + variables.allowedLocalhostPrefixes.join(' or ') +
+        '; offending containers: ' + variables.badContainers.join(', ')
+      reason: Forbidden
+    - expression: >-
+        has(object.spec.nodeSelector) &&
+        'minified.dev/apparmor' in object.spec.nodeSelector &&
+        object.spec.nodeSelector['minified.dev/apparmor'] == 'enforcing'
+      message: "pod must set nodeSelector minified.dev/apparmor: enforcing so it only schedules on AppArmor nodes"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: minified-require-apparmor
+spec:
+  policyName: minified-require-apparmor
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        minified.dev/apparmor-required: "true"
