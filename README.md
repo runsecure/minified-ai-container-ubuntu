@@ -24,9 +24,10 @@ Runs as `65532:65532` by default.
 ### Build
 
 ```sh
-docker buildx bake --load                 # both releases, all variants (core, -selinux, -apparmor)
+docker buildx bake --load                 # both releases, all images (core + python, plain/-selinux/-apparmor)
 docker buildx bake --load core-24-04      # just one
-docker buildx bake --push core-all-platforms   # amd64 + arm64, needs a registry
+docker buildx bake --load python-images   # just the python images
+docker buildx bake --push all-platforms   # amd64 + arm64, needs a registry
 REGISTRY=myregistry.io/me docker buildx bake --load
 ```
 
@@ -43,6 +44,45 @@ bash tests/smoke.sh 26.04      # one release
 The tests copy a glibc-linked binary (`getent`) into the image and check that the
 dynamic loader, glibc and NSS user lookup work. They also check that there's no
 shell or package manager, and that the CA bundle and chisel manifest are present.
+
+## Python image (AI runtime base)
+
+Core plus the distro CPython, built from the same Chisel slices. Each Ubuntu release
+ships one Python, so the version follows the release:
+
+| Image | Python | Rootfs (uncompressed / gzip) |
+|---|---|---|
+| `minified/ubuntu-python:24.04` (also `:3.12-24.04`) | 3.12 | ~54 MB / ~19 MB |
+| `minified/ubuntu-python:26.04` (also `:3.14-26.04`) | 3.14 | ~62 MB / ~22 MB |
+| `…:{24.04,26.04}-selinux`, `…-apparmor` | same | + `container-guard` entrypoint, as for core |
+
+Slices on top of core: `python3.X_standard` (the full stdlib), `python3-minimal_python3`
+(`/usr/bin/python3`), `libstdc++6_libs` (needed by nearly every AI/ML wheel: numpy,
+torch, onnxruntime, …) and `tzdata_zoneinfo`.
+
+- **No pip, venv or ensurepip** in the runtime. Install dependencies in a build stage
+  and copy them in (below).
+- **Stdlib precompiled** at build time (`--invalidation-mode unchecked-hash`), since
+  Chisel ships only `.py` files and the root filesystem is read-only at runtime.
+  `PYTHONDONTWRITEBYTECODE=1` stops attempts to write `.pyc` files.
+- `CMD ["python3"]`, `LANG=C.UTF-8`, `PYTHONUNBUFFERED=1`, uid 65532, no shell.
+
+**Adding dependencies:** see [examples/python-app/](examples/python-app/). In an
+`ubuntu:<same release>` stage, create a venv with the distro `python3-venv` (same
+CPython minor and glibc as the runtime), `pip install --only-binary=:all:`, remove pip,
+precompile, then copy `/opt/venv` and the app into the Python image and set `CMD`:
+
+```dockerfile
+FROM minified/ubuntu-python:24.04-selinux
+COPY --from=deps /opt/venv /opt/venv
+COPY --from=deps /opt/app /opt/app
+ENV PATH=/opt/venv/bin:${PATH}
+CMD ["python3", "/opt/app/app.py"]    # CMD only: keeps container-guard in front
+```
+
+Wheels that need extra system libraries (e.g. `libgomp1` for some OpenMP builds, or
+`libgl1` for OpenCV) need their slices added to `PYTHON_SLICES` in the
+[Dockerfile](Dockerfile). Most manylinux wheels bundle their own copies.
 
 ## LSM (SELinux or AppArmor) + seccomp enforcement (Kubernetes)
 
@@ -135,6 +175,17 @@ kubectl -n minified-apparmor-apps logs deploy/example | grep container-guard
   `ptrace`, `unshare(CLONE_NEWUSER)`, `personality(ADDR_NO_RANDOMIZE)`, `clone3`, etc.
 - **Smoke:** on a host without the variant's LSM (Docker Desktop has neither), the
   `-selinux` and `-apparmor` images must refuse to start (exit 126).
+- **Python:** `docker buildx bake --load python-images guard-testbin && bash tests/python.sh`.
+  It checks the image layout, then runs [tests/python-selftest.py](tests/python-selftest.py)
+  (TLS/CA bundle, OpenSSL, sqlite, ctypes, threads, subprocess, every multiprocessing
+  start method, asyncio, NSS, zoneinfo) with the pod settings from the examples:
+  read-only root, tmpfs `/tmp`, all capabilities dropped. It runs the same self-test
+  **under the guard's seccomp filter**, using a test-only guard build
+  (`guard-testbin`, [tests/guarded.Dockerfile](tests/guarded.Dockerfile)): the
+  production filter code, but it reads a fake SELinux label from a file, so it runs
+  on Docker Desktop. **Never publish that binary or any image built from that file.**
+  It also builds [examples/python-app](examples/python-app) (numpy from PyPI, so it needs
+  network; `SKIP_EXAMPLE=1` to skip) and runs it plain and under the filter.
 - **Kubernetes admission:** `bash tests/k8s-admission.sh` (any cluster ≥ 1.30, e.g.
   Docker Desktop) applies both policies and checks that the API server reports no
   CEL type errors. It then sends 26 pods as server-side dry runs, admitted or rejected
@@ -145,8 +196,11 @@ kubectl -n minified-apparmor-apps logs deploy/example | grep container-guard
 
 ### Customizing
 
-Add slices to the `SLICES` build arg in the [Dockerfile](Dockerfile), for example
-`tzdata_zoneinfo`, `libssl3t64_libs` or `libstdc++6_libs`. Browse the available slices
+Add slices to the `SLICES` build arg in the [Dockerfile](Dockerfile) (core and every
+image built on it) or to `PYTHON_SLICES` (Python images only), for example
+`libssl3t64_libs` or `libgomp1_libs`. To shrink the Python image, swap
+`python3.X_standard` for `python3.X_core` plus only the `libpython3.X-stdlib_*`
+slices you need. Browse the available slices
 for a release in [chisel-releases](https://github.com/canonical/chisel-releases)
 (`ubuntu-24.04` / `ubuntu-26.04` branches).
 
